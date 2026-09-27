@@ -541,8 +541,12 @@ object NativeCore {
                 .put("message", "国际版额度由上游自动发放，已刷新当前额度")
         }
 
-        // ① 签到前快照：从本地已缓存的额度取，取不到则为 null（明确区分"没查到"与"是 0"）
+        // ① 签到前快照。
+        //    优先用本地缓存（省一次请求）；若从未刷新过额度（缓存为空），
+        //    则主动查一次 —— 否则 gained 永远算不出来，界面会一直显示
+        //    "缺少签到前快照"，那对用户是无意义的噪声。
         val before = readCachedCredits(context, account.key)
+            ?: runCatching { refreshCredits(context, account.key).optDouble("remain") }.getOrNull()
 
         val h = headersForFresh(context, account).apply { this["User-Agent"] = ClientIdentity.BROWSER_UA }
         val data = executeJson(
@@ -580,8 +584,11 @@ object NativeCore {
     /**
      * 拼签到结果文案。
      *
-     * 文案分四种情况，核心是【不谎报】：查不到额度就说查不到，
-     * 而不是显示成 0 分（那会让人以为签到没生效）。
+     * 四种情况，核心是【不谎报】：
+     *   · 到账   → 明确写出 +N 与当前剩余
+     *   · 未变化 → 说明签到额可能随后续活跃行为计分（用户最常见的困惑）
+     *   · 减少   → 如实显示负数（可能是其它请求消耗，不是签到扣的）
+     *   · 查不到 → 说明查询失败并给出下一步，而不是显示 0 分
      */
     private fun buildCheckinMessage(
         already: Boolean,
@@ -595,22 +602,28 @@ object NativeCore {
             gained != null && gained > 0 ->
                 "$head，本次 +%.1f 积分（当前剩余 $remainText）".format(gained)
             gained != null && gained == 0.0 ->
-                "$head，额度未变化（当前剩余 $remainText；签到额可能需要随后续活跃行为才计分）"
+                "$head，本次未增加积分（当前剩余 $remainText）。签到本身的奖励可能随后续活跃行为计分。"
             gained != null ->
-                "$head，额度减少 %.1f（当前剩余 $remainText）".format(-gained)
-            remaining != null ->
-                "$head，当前剩余 $remainText（缺少签到前快照，无法计算本次增量）"
+                "$head（当前剩余 $remainText）。额度比签到前少 %.1f，通常是期间其它请求的消耗。".format(-gained)
             else ->
-                "$head（额度查询失败，请稍后在账号页刷新）"
+                "$head（额度查询失败，请稍后在账号页手动刷新）"
         }
     }
 
     /** 读取本地缓存的剩余额度；未刷新过则返回 null。 */
+    /**
+     * 读取本地缓存的剩余额度；未刷新过则返回 null。
+     *
+     * 注意取值路径：账号 JSON 由 NativeStore.accountJson 用 rowJson 平铺生成，
+     * credits_remaining 就在【根对象上】。
+     * 早先误取 account.profile（即 root.account），而账号表没有嵌套的 account 子对象，
+     * 于是永远读到 null，签到结果恒定显示"缺少签到前快照"。
+     */
     private fun readCachedCredits(context: Context, accountKey: String): Double? {
         val account = loadAccount(context, accountKey) ?: return null
-        val raw = account.profile
-        if (raw.isNull("credits_remaining")) return null
-        val value = raw.optDouble("credits_remaining", Double.NaN)
+        val root = account.root
+        if (root.isNull("credits_remaining")) return null
+        val value = root.optDouble("credits_remaining", Double.NaN)
         return if (value.isFinite()) value else null
     }
 
